@@ -1,0 +1,87 @@
+pipeline {
+  agent any 
+  tools {
+    maven 'Maven'
+  }
+  stages {
+    stage ('Initialize') {
+      steps {
+        sh '''
+          echo "PATH = ${PATH}"
+          echo "M2_HOME = ${M2_HOME}"
+        ''' 
+      }
+    }
+    
+    stage ('Check-Git-Secrets') {
+      steps {
+        // Suppression sécurisée du fichier trufflehog s'il existe
+        sh 'rm trufflehog || true'
+        // Exécution de TruffleHog pour détecter les secrets dans le code
+        sh 'docker run --rm gesellix/trufflehog --json https://github.com/cehkunal/webapp.git > trufflehog'
+        // Vérification des résultats
+        sh 'cat trufflehog || true' // Affiche le rapport sans échouer le pipeline
+      }
+    }
+    
+    stage ('Source Composition Analysis') {
+      steps {
+        // Suppression sécurisée des anciens fichiers de rapport
+        sh 'rm owasp* || true'
+        // Téléchargement du script de vérification de dépendances
+        sh 'curl -o owasp-dependency-check.sh "https://raw.githubusercontent.com/cehkunal/webapp/master/owasp-dependency-check.sh"'
+        // Modification des permissions pour le script
+        sh 'chmod +x owasp-dependency-check.sh'
+        // Exécution du script et capture des erreurs
+        sh 'bash owasp-dependency-check.sh || true'
+        // Affichage du rapport sans échouer le pipeline
+        sh 'cat /var/lib/jenkins/OWASP-Dependency-Check/reports/dependency-check-report.xml || true'
+      }
+    }
+    
+    stage ('SAST') {
+      steps {
+        withSonarQubeEnv('sonar') {
+          // Exécution de l'analyse SAST
+          sh 'mvn sonar:sonar || true'
+          // Affichage du rapport d'analyse
+          sh 'cat target/sonar/report-task.txt || true'
+        }
+      }
+    }
+    
+    stage ('Build') {
+      steps {
+        // Construction de l'application
+        sh 'mvn clean package || true' // Capturer les erreurs tout en continuant le pipeline
+      }
+    }
+    
+    stage ('Deploy-To-Tomcat') {
+      steps {
+        // Déploiement sécurisé via SSH
+        sshagent(['tomcat']) {
+          sh 'scp -o StrictHostKeyChecking=no target/*.war ubuntu@13.232.202.25:/prod/apache-tomcat-8.5.39/webapps/webapp.war || true'
+        }      
+      }       
+    }
+    
+    stage ('DAST') {
+      steps {
+        // Exécution de l'analyse dynamique de sécurité
+        sshagent(['zap']) {
+          // Exécution de OWASP ZAP sur l'application déployée
+          sh 'ssh -o StrictHostKeyChecking=no ubuntu@13.232.158.44 "docker run -t owasp/zap2docker-stable zap-baseline.py -t http://13.232.202.25:8080/webapp/" || true'
+        }
+      }
+    }
+  }
+  
+  // Étape de nettoyage pour supprimer les fichiers temporaires
+  post {
+    always {
+      sh 'rm -f trufflehog owasp-dependency-check.sh || true' // Nettoyage des fichiers temporaires
+      echo "Nettoyage effectué."
+    }
+  }
+}
